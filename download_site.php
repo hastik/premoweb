@@ -36,10 +36,32 @@ final class SiteDownloader
     private array $pageLocalPathByUrl = [];
     /** @var array<string, string> */
     private array $assetLocalPathByUrl = [];
+    /**
+     * Hierarchy nodes keyed by page id from body[id=page-N].
+     *
+     * @var array<string, array{
+     *   id: string,
+     *   bodyId: string,
+     *   title: string,
+     *   sourceUrl: string,
+     *   file: string,
+     *   path: string,
+     *   parents: list<string>,
+     *   children: list<string>
+     * }>
+     */
+    private array $pageNodes = [];
+    /**
+     * Pages without body id=page-N.
+     *
+     * @var list<array{title: string, sourceUrl: string, file: string, path: string}>
+     */
+    private array $pagesWithoutId = [];
 
     private string $projectRoot;
     private string $pagesRoot;
     private string $assetsRoot;
+    private string $treeJsonPath;
 
     public function __construct(string $rootUrl, string $projectRoot)
     {
@@ -65,6 +87,7 @@ final class SiteDownloader
         $this->projectRoot = rtrim($projectRoot, DIRECTORY_SEPARATOR);
         $this->pagesRoot = $this->projectRoot . DIRECTORY_SEPARATOR . 'pages';
         $this->assetsRoot = $this->projectRoot . DIRECTORY_SEPARATOR . 'assets';
+        $this->treeJsonPath = $this->projectRoot . DIRECTORY_SEPARATOR . 'pages-tree.json';
     }
 
     public function run(): void
@@ -114,6 +137,7 @@ final class SiteDownloader
             }
 
             $pageRelativePath = $this->getPageLocalRelativePath($effectiveUrl);
+            $this->registerPageHierarchy($response['body'], $effectiveUrl, $pageRelativePath);
             $rewrittenHtml = $this->rewriteHtmlAndQueueLinks(
                 $response['body'],
                 $effectiveUrl
@@ -126,9 +150,13 @@ final class SiteDownloader
             $downloadedPages++;
         }
 
+        $this->writePageTreeJson();
+
         echo "\nHotovo.\n";
         echo "Stazenych HTML stranek: {$downloadedPages}\n";
         echo "Stazenych assetu: " . count($this->assetLocalPathByUrl) . "\n";
+        echo "Stranek ve stromu (page-ID): " . count($this->pageNodes) . "\n";
+        echo "Strom stranek: {$this->treeJsonPath}\n";
         echo "Vystup: {$this->pagesRoot} a {$this->assetsRoot}\n";
     }
 
@@ -228,6 +256,183 @@ final class SiteDownloader
 
         return str_starts_with(ltrim($body), '<!DOCTYPE html')
             || str_starts_with(ltrim($body), '<html');
+    }
+
+    private function registerPageHierarchy(string $html, string $sourceUrl, string $localRelativePath): void
+    {
+        $title = $this->extractTitle($html);
+        $bodyId = $this->extractBodyPageId($html);
+        $parents = $this->extractBodyParentIds($html, $bodyId);
+        $publicPath = $this->toPublicUrl($localRelativePath);
+
+        if ($bodyId === null) {
+            $this->pagesWithoutId[] = [
+                'title' => $title,
+                'sourceUrl' => $sourceUrl,
+                'file' => $localRelativePath,
+                'path' => $publicPath,
+            ];
+            return;
+        }
+
+        $existingParents = $this->pageNodes[$bodyId]['parents'] ?? [];
+        $mergedParents = array_values(array_unique(array_merge($existingParents, $parents)));
+        sort($mergedParents, SORT_NATURAL);
+
+        $this->pageNodes[$bodyId] = [
+            'id' => $bodyId,
+            'bodyId' => 'page-' . $bodyId,
+            'title' => $title,
+            'sourceUrl' => $sourceUrl,
+            'file' => $localRelativePath,
+            'path' => $publicPath,
+            'parents' => $mergedParents,
+            'children' => [],
+        ];
+    }
+
+    private function extractTitle(string $html): string
+    {
+        if (preg_match('/<title\b[^>]*>(.*?)<\/title>/is', $html, $matches) !== 1) {
+            return '';
+        }
+
+        $title = html_entity_decode(strip_tags($matches[1]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        return trim(preg_replace('/\s+/u', ' ', $title) ?? $title);
+    }
+
+    private function extractBodyPageId(string $html): ?string
+    {
+        if (preg_match('/<body\b([^>]*)>/is', $html, $bodyMatch) !== 1) {
+            return null;
+        }
+
+        if (preg_match('/\bid\s*=\s*(["\'])\s*(page-(\d+))\s*\1/i', $bodyMatch[1], $idMatch) !== 1) {
+            return null;
+        }
+
+        return $idMatch[3];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function extractBodyParentIds(string $html, ?string $selfId): array
+    {
+        if (preg_match('/<body\b([^>]*)>/is', $html, $bodyMatch) !== 1) {
+            return [];
+        }
+
+        if (preg_match('/\bstyle\s*=\s*(["\'])(.*?)\1/is', $bodyMatch[1], $styleMatch) !== 1) {
+            return [];
+        }
+
+        if (preg_match_all('/page-(\d+)/i', $styleMatch[2], $parentMatches) === false) {
+            return [];
+        }
+
+        $parents = [];
+        foreach ($parentMatches[1] as $parentId) {
+            if ($selfId !== null && $parentId === $selfId) {
+                continue;
+            }
+            $parents[] = $parentId;
+        }
+
+        $parents = array_values(array_unique($parents));
+        sort($parents, SORT_NATURAL);
+        return $parents;
+    }
+
+    private function writePageTreeJson(): void
+    {
+        ksort($this->pageNodes, SORT_NATURAL);
+
+        foreach ($this->pageNodes as &$node) {
+            $node['children'] = [];
+        }
+        unset($node);
+
+        foreach ($this->pageNodes as $id => $node) {
+            foreach ($node['parents'] as $parentId) {
+                if (!isset($this->pageNodes[$parentId])) {
+                    continue;
+                }
+                $this->pageNodes[$parentId]['children'][] = $id;
+            }
+        }
+
+        foreach ($this->pageNodes as &$node) {
+            $node['children'] = array_values(array_unique($node['children']));
+            sort($node['children'], SORT_NATURAL);
+        }
+        unset($node);
+
+        $rootIds = [];
+        foreach ($this->pageNodes as $id => $node) {
+            $hasKnownParent = false;
+            foreach ($node['parents'] as $parentId) {
+                if (isset($this->pageNodes[$parentId])) {
+                    $hasKnownParent = true;
+                    break;
+                }
+            }
+            if (!$hasKnownParent) {
+                $rootIds[] = $id;
+            }
+        }
+
+        $tree = [];
+        foreach ($rootIds as $rootId) {
+            $tree[] = $this->buildTreeNode($rootId, []);
+        }
+
+        $payload = [
+            'rootUrl' => $this->rootUrl,
+            'generatedAt' => gmdate('c'),
+            'pages' => $this->pageNodes,
+            'tree' => $tree,
+            'pagesWithoutId' => $this->pagesWithoutId,
+        ];
+
+        $json = json_encode(
+            $payload,
+            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+        );
+        if ($json === false) {
+            throw new RuntimeException('Nepodarilo se serializovat pages-tree.json');
+        }
+
+        file_put_contents($this->treeJsonPath, $json . "\n");
+    }
+
+    /**
+     * @param list<string> $ancestors
+     * @return array{id: string, bodyId: string, title: string, path: string, file: string, children: list<array<mixed>>}
+     */
+    private function buildTreeNode(string $id, array $ancestors): array
+    {
+        $node = $this->pageNodes[$id];
+        $children = [];
+
+        if (!in_array($id, $ancestors, true)) {
+            $nextAncestors = [...$ancestors, $id];
+            foreach ($node['children'] as $childId) {
+                if (!isset($this->pageNodes[$childId])) {
+                    continue;
+                }
+                $children[] = $this->buildTreeNode($childId, $nextAncestors);
+            }
+        }
+
+        return [
+            'id' => $node['id'],
+            'bodyId' => $node['bodyId'],
+            'title' => $node['title'],
+            'path' => $node['path'],
+            'file' => $node['file'],
+            'children' => $children,
+        ];
     }
 
     private function rewriteHtmlAndQueueLinks(string $html, string $pageUrl): string
