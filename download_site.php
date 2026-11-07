@@ -116,8 +116,7 @@ final class SiteDownloader
             $pageRelativePath = $this->getPageLocalRelativePath($effectiveUrl);
             $rewrittenHtml = $this->rewriteHtmlAndQueueLinks(
                 $response['body'],
-                $effectiveUrl,
-                $pageRelativePath
+                $effectiveUrl
             );
 
             $targetFile = $this->projectRoot . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $pageRelativePath);
@@ -231,7 +230,7 @@ final class SiteDownloader
             || str_starts_with(ltrim($body), '<html');
     }
 
-    private function rewriteHtmlAndQueueLinks(string $html, string $pageUrl, string $pageRelativePath): string
+    private function rewriteHtmlAndQueueLinks(string $html, string $pageUrl): string
     {
         libxml_use_internal_errors(true);
         $dom = new DOMDocument();
@@ -248,21 +247,21 @@ final class SiteDownloader
             if (!$node instanceof DOMElement) {
                 continue;
             }
-            $this->rewriteUrlAttribute($node, 'href', $pageUrl, $pageRelativePath);
+            $this->rewriteUrlAttribute($node, 'href', $pageUrl);
         }
 
         foreach ($xpath->query('//*[@src]') ?: [] as $node) {
             if (!$node instanceof DOMElement) {
                 continue;
             }
-            $this->rewriteUrlAttribute($node, 'src', $pageUrl, $pageRelativePath);
+            $this->rewriteUrlAttribute($node, 'src', $pageUrl);
         }
 
         foreach ($xpath->query('//*[@poster]') ?: [] as $node) {
             if (!$node instanceof DOMElement) {
                 continue;
             }
-            $this->rewriteAssetAttribute($node, 'poster', $pageUrl, $pageRelativePath);
+            $this->rewriteAssetAttribute($node, 'poster', $pageUrl);
         }
 
         foreach ($xpath->query('//*[@data]') ?: [] as $node) {
@@ -270,7 +269,7 @@ final class SiteDownloader
                 continue;
             }
             if (strtolower($node->nodeName) === 'object') {
-                $this->rewriteAssetAttribute($node, 'data', $pageUrl, $pageRelativePath);
+                $this->rewriteAssetAttribute($node, 'data', $pageUrl);
             }
         }
 
@@ -279,7 +278,7 @@ final class SiteDownloader
                 continue;
             }
             $srcset = $node->getAttribute('srcset');
-            $rewritten = $this->rewriteSrcset($srcset, $pageUrl, $pageRelativePath);
+            $rewritten = $this->rewriteSrcset($srcset, $pageUrl);
             $node->setAttribute('srcset', $rewritten);
         }
 
@@ -288,7 +287,7 @@ final class SiteDownloader
                 continue;
             }
             $style = $node->getAttribute('style');
-            $node->setAttribute('style', $this->rewriteCssUrls($style, $pageUrl, $pageRelativePath));
+            $node->setAttribute('style', $this->rewriteCssUrls($style, $pageUrl));
         }
 
         foreach ($xpath->query('//style') ?: [] as $node) {
@@ -299,7 +298,7 @@ final class SiteDownloader
             if ($css === null || $css === '') {
                 continue;
             }
-            $node->textContent = $this->rewriteCssUrls($css, $pageUrl, $pageRelativePath);
+            $node->textContent = $this->rewriteCssUrls($css, $pageUrl);
         }
 
         $result = $dom->saveHTML();
@@ -309,8 +308,7 @@ final class SiteDownloader
     private function rewriteUrlAttribute(
         DOMElement $node,
         string $attribute,
-        string $pageUrl,
-        string $pageRelativePath
+        string $pageUrl
     ): void {
         $rawValue = trim($node->getAttribute($attribute));
         if ($rawValue === '' || $this->isSkippableReference($rawValue)) {
@@ -329,7 +327,7 @@ final class SiteDownloader
         if ($isPage) {
             $this->enqueuePage($absoluteUrl);
             $localTarget = $this->getPageLocalRelativePath($absoluteUrl);
-            $rewritten = $this->makeRelativePath($pageRelativePath, $localTarget);
+            $rewritten = $this->toPublicUrl($localTarget);
             if ($fragment !== null && $fragment !== '') {
                 $rewritten .= '#' . $fragment;
             }
@@ -342,7 +340,7 @@ final class SiteDownloader
             return;
         }
 
-        $rewritten = $this->makeRelativePath($pageRelativePath, $assetPath);
+        $rewritten = $this->toPublicUrl($assetPath);
         if ($fragment !== null && $fragment !== '') {
             $rewritten .= '#' . $fragment;
         }
@@ -352,8 +350,7 @@ final class SiteDownloader
     private function rewriteAssetAttribute(
         DOMElement $node,
         string $attribute,
-        string $pageUrl,
-        string $pageRelativePath
+        string $pageUrl
     ): void {
         $rawValue = trim($node->getAttribute($attribute));
         if ($rawValue === '' || $this->isSkippableReference($rawValue)) {
@@ -370,10 +367,10 @@ final class SiteDownloader
             return;
         }
 
-        $node->setAttribute($attribute, $this->makeRelativePath($pageRelativePath, $assetPath));
+        $node->setAttribute($attribute, $this->toPublicUrl($assetPath));
     }
 
-    private function rewriteSrcset(string $srcset, string $pageUrl, string $pageRelativePath): string
+    private function rewriteSrcset(string $srcset, string $pageUrl): string
     {
         $parts = array_map('trim', explode(',', $srcset));
         $rewrittenParts = [];
@@ -395,7 +392,7 @@ final class SiteDownloader
             if ($absoluteUrl !== null && $this->isInternalUrl($absoluteUrl)) {
                 $assetPath = $this->downloadAsset($absoluteUrl);
                 if ($assetPath !== null) {
-                    $urlToken = $this->makeRelativePath($pageRelativePath, $assetPath);
+                    $urlToken = $this->toPublicUrl($assetPath);
                 }
             }
 
@@ -405,11 +402,11 @@ final class SiteDownloader
         return implode(', ', $rewrittenParts);
     }
 
-    private function rewriteCssUrls(string $css, string $pageUrl, string $pageRelativePath): string
+    private function rewriteCssUrls(string $css, string $pageUrl): string
     {
         $result = preg_replace_callback(
             '/url\(\s*(["\']?)([^"\')]+)\1\s*\)/i',
-            function (array $matches) use ($pageUrl, $pageRelativePath): string {
+            function (array $matches) use ($pageUrl): string {
                 $rawUrl = trim($matches[2]);
                 if ($rawUrl === '' || $this->isSkippableReference($rawUrl)) {
                     return $matches[0];
@@ -425,8 +422,8 @@ final class SiteDownloader
                     return $matches[0];
                 }
 
-                $relative = $this->makeRelativePath($pageRelativePath, $assetPath);
-                return 'url(' . $matches[1] . $relative . $matches[1] . ')';
+                $publicUrl = $this->toPublicUrl($assetPath);
+                return 'url(' . $matches[1] . $publicUrl . $matches[1] . ')';
             },
             $css
         );
@@ -437,7 +434,7 @@ final class SiteDownloader
 
         return preg_replace_callback(
             '/@import\s+(["\'])([^"\']+)\1/i',
-            function (array $matches) use ($pageUrl, $pageRelativePath): string {
+            function (array $matches) use ($pageUrl): string {
                 $rawUrl = trim($matches[2]);
                 if ($rawUrl === '' || $this->isSkippableReference($rawUrl)) {
                     return $matches[0];
@@ -453,8 +450,8 @@ final class SiteDownloader
                     return $matches[0];
                 }
 
-                $relative = $this->makeRelativePath($pageRelativePath, $assetPath);
-                return '@import ' . $matches[1] . $relative . $matches[1];
+                $publicUrl = $this->toPublicUrl($assetPath);
+                return '@import ' . $matches[1] . $publicUrl . $matches[1];
             },
             $result
         ) ?? $result;
@@ -834,26 +831,36 @@ final class SiteDownloader
         return isset($this->allowedHosts[$host]);
     }
 
-    private function makeRelativePath(string $fromFile, string $toFile): string
+    /**
+     * Convert a stored local path into a public URL used with .htaccess rewrites.
+     * pages/index.html → /
+     * pages/xyz.html → /xyz
+     * pages/blog/post.html → /blog/post
+     * assets/img/logo.png → /assets/img/logo.png
+     */
+    private function toPublicUrl(string $localRelativePath): string
     {
-        $fromDir = explode('/', trim(dirname($fromFile), '/'));
-        $toPath = explode('/', trim($toFile, '/'));
+        $path = ltrim(str_replace('\\', '/', $localRelativePath), '/');
 
-        if ($fromDir === ['.'] || $fromDir === ['']) {
-            $fromDir = [];
+        if (str_starts_with($path, 'pages/')) {
+            $pagePath = substr($path, strlen('pages/'));
+
+            if ($pagePath === 'index.html') {
+                return '/';
+            }
+
+            if (str_ends_with($pagePath, '/index.html')) {
+                return '/' . substr($pagePath, 0, -strlen('/index.html'));
+            }
+
+            if (str_ends_with($pagePath, '.html')) {
+                return '/' . substr($pagePath, 0, -strlen('.html'));
+            }
+
+            return '/' . $pagePath;
         }
 
-        $commonLength = 0;
-        $maxCommon = min(count($fromDir), count($toPath));
-        while ($commonLength < $maxCommon && $fromDir[$commonLength] === $toPath[$commonLength]) {
-            $commonLength++;
-        }
-
-        $up = array_fill(0, count($fromDir) - $commonLength, '..');
-        $down = array_slice($toPath, $commonLength);
-        $relativeParts = array_merge($up, $down);
-
-        return $relativeParts === [] ? './' : implode('/', $relativeParts);
+        return '/' . $path;
     }
 }
 
