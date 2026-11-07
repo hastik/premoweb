@@ -1,0 +1,29 @@
+# Apache rewrite for mirrored static site.
+# Serves clean URLs from pages/*.html while keeping /assets available.
+
+DirectoryIndex pages/index.html
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # Keep real files and directories (e.g. /assets/...) as-is.
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # / → pages/index.html
+    RewriteRule ^$ pages/index.html [L]
+
+    # /xyz/ → pages/xyz/index.html
+    RewriteCond %{DOCUMENT_ROOT}/pages/$1/index.html -f
+    RewriteRule ^(.+)/$ pages/$1/index.html [L]
+
+    # /xyz → pages/xyz.html
+    RewriteCond %{DOCUMENT_ROOT}/pages/$1.html -f
+    RewriteRule ^(.+)$ pages/$1.html [L]
+
+    # /xyz → pages/xyz/index.html (directory-style pages without trailing slash)
+    RewriteCond %{DOCUMENT_ROOT}/pages/$1/index.html -f
+    RewriteRule ^(.+)$ pages/$1/index.html [L]
+</IfModule>
